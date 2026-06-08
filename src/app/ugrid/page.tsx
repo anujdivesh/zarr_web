@@ -38,7 +38,7 @@ export default function UgridMapPage() {
         id: "ugrid",
         name: "Wave height (unstructured)",
         datasetName: "rarotonga_ugrid.zarr",
-        zarrBaseUrl: "/api/zarr/",
+        zarrBaseUrl: "/zarr-web/api/zarr/",
         variable: "hs",
         directionVariable: "dirm",
         colorRange: { min: 0, max: 4 },

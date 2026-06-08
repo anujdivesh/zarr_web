@@ -1,4 +1,7 @@
 import type { UgridLayerConfig } from "./UgridOverlay";
+import type { WindConfig } from "./WindAnimationOverlay";
+
+const APP_BASE_PATH = "/zarr-web";
 
 export interface ZarrLayerConfig {
   type: "zarr";
@@ -12,6 +15,7 @@ export interface ZarrLayerConfig {
   colormap?: string;           // e.g., "jet", "red-blue" (defaults to jet)
   showRaster?: boolean;        // default true
   showArrows?: boolean;        // default true when directionVariable provided
+  windAnimation?: WindConfig;
   // Optional custom color function or colormap name
 }
 
@@ -33,7 +37,7 @@ export type LayerConfig = ZarrLayerConfig | UgridLayerConfig; // | GeoJsonLayerC
 
 // Local/public option: any dataset placed under `public/<datasetName>/` can be
 // loaded via an API proxy to allow reading Zarr dotfiles (e.g. `.zmetadata`).
-const LOCAL_PUBLIC_ZARR_BASE_URL = "/api/zarr/";
+const LOCAL_PUBLIC_ZARR_BASE_URL = `${APP_BASE_PATH}/api/zarr/`;
 
 export const layersConfig: LayerConfig[] = [
   {
@@ -46,6 +50,17 @@ export const layersConfig: LayerConfig[] = [
     directionVariable: "mn_wav_dir",
     colorRange: { min: 0, max: 4 },
     colormap: "jet",
+    windAnimation: {
+      datasetName: "wavewatch3.zarr",
+      zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",
+      speedVariable: "sig_wav_ht",
+      directionVariable: "mn_wav_dir",
+      latVariable: "lat",
+      lonVariable: "lon",
+      speedFactor: 0.02,
+      particleCount: 3000,
+      particleSize: 4,
+    },
   },
   {
     type: "zarr",
@@ -65,7 +80,7 @@ export const layersConfig: LayerConfig[] = [
     id: "inundation-depth",
     name: "Inundation Depth",
     datasetName: "raro_inun2.zarr",
-    zarrBaseUrl: "/api/zarr/",    // or wherever your API routes serve the Zarr
+    zarrBaseUrl: LOCAL_PUBLIC_ZARR_BASE_URL,
     heightVariable: "h",
     // Remove colorRange and colormap temporarily
     showRaster: true,

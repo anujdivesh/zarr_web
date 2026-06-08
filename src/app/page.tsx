@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import { layersConfig, LayerConfig } from "@/lib/layers.config";
 import { UgridOverlay } from "@/lib/UgridOverlay";
+import { WindAnimationOverlay } from "@/lib/WindAnimationOverlay";
 import { ZarrOverlay } from "@/lib/zarrOverlay";
 import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -22,7 +23,9 @@ export default function Home() {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const overlayRef = useRef<OverlayController | null>(null);
+  const windRef = useRef<WindAnimationOverlay | null>(null);
   const [selectedLayerId, setSelectedLayerId] = useState(layersConfig[0].id);
+  const [showWind, setShowWind] = useState(false);
   const [layerUi, setLayerUi] = useState({
     loading: false,
     error: null as string | null,
@@ -67,6 +70,10 @@ export default function Home() {
   useEffect(() => {
     if (!mapRef.current) return;
     if (overlayRef.current) overlayRef.current.destroy();
+    if (windRef.current) {
+      windRef.current.destroy();
+      windRef.current = null;
+    }
 
     setLayerUi({
       loading: false,
@@ -93,6 +100,30 @@ export default function Home() {
     return () => overlay.destroy();
   }, [selectedLayerId, currentLayer]);
 
+  useEffect(() => {
+    if (!mapRef.current) return;
+
+    if (windRef.current) {
+      windRef.current.destroy();
+      windRef.current = null;
+    }
+
+    if (currentLayer.type !== "zarr" || !currentLayer.windAnimation || !showWind) {
+      return;
+    }
+
+    const wind = new WindAnimationOverlay(mapRef.current, currentLayer.windAnimation);
+    wind.setTimeIndex(layerUi.timeIndex);
+    windRef.current = wind;
+
+    return () => {
+      wind.destroy();
+      if (windRef.current === wind) {
+        windRef.current = null;
+      }
+    };
+  }, [currentLayer, showWind, layerUi.timeIndex]);
+
   const togglePlayback = () => {
     if (!overlayRef.current) return;
     if (layerUi.isPlaying) overlayRef.current.stopPlayback();
@@ -111,6 +142,17 @@ export default function Home() {
         <select value={selectedLayerId} onChange={e => setSelectedLayerId(e.target.value)}>
           {layersConfig.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
         </select>
+        {currentLayer.type === "zarr" && currentLayer.windAnimation && (
+          <label style={{ display: "block", marginTop: 8, fontSize: 13 }}>
+            <input
+              type="checkbox"
+              checked={showWind}
+              onChange={(e) => setShowWind(e.target.checked)}
+              style={{ marginRight: 6 }}
+            />
+            Flow particles
+          </label>
+        )}
       </div>
       <div style={{ position: "absolute", bottom: 16, right: 16, zIndex: 10, width: 320, padding: 16, borderRadius: 12, background: "rgba(15,23,42,0.9)", color: "#f8fafc" }}>
         <div style={{ fontWeight: "bold" }}>{currentLayer.name}</div>

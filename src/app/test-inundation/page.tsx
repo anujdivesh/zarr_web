@@ -29,7 +29,7 @@ export default function TestPage() {
         id: "test",
         name: "Test",
         datasetName: "raro_inun.zarr",
-        zarrBaseUrl: "/api/zarr/",
+        zarrBaseUrl: "/zarr-web/api/zarr/",
         heightVariable: "Depth",
         colorRange: { min: 0, max: 2 },
         showRaster: true,

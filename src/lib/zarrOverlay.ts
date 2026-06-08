@@ -109,6 +109,15 @@ function computeEdges(values: ArrayLike<number>) {
   edges[values.length] = values[values.length - 1] + (values[values.length - 1] - values[values.length - 2]) / 2;
   return edges;
 }
+function computeRepresentativeStep(values: number[], axisName: string) {
+  for (let i = 1; i < values.length; i++) {
+    const step = values[i] - values[i - 1];
+    if (Number.isFinite(step) && step !== 0) {
+      return step;
+    }
+  }
+  throw new Error(`Invalid coordinate step for ${axisName}: all adjacent values are identical.`);
+}
 function assertFiniteNumber(name: string, value: number) {
   if (!Number.isFinite(value)) {
     throw new Error(`Invalid ${name}: ${String(value)}`);
@@ -554,8 +563,8 @@ export class ZarrOverlay {
       throw new Error(`Coordinate arrays must have length >= 2 (lat=${latValues.length}, lon=${lonValues.length}).`);
     }
 
-    const latStep = latValues[1] - latValues[0];
-    const lonStep = lonValues[1] - lonValues[0];
+    const latStep = computeRepresentativeStep(latValues, latName);
+    const lonStep = computeRepresentativeStep(lonValues, lonName);
     assertFiniteNumber("latitude step", latStep);
     assertFiniteNumber("longitude step", lonStep);
     if (latStep === 0 || lonStep === 0) {
