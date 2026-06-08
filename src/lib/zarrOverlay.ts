@@ -21,9 +21,44 @@ const DIRECTION_ARROW_ICON = `data:image/svg+xml;utf8,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><path d="M32 4 L50 24 H39 V60 H25 V24 H14 Z" fill="white"/></svg>',
 )}`;
 
+type DirectionMetadata = {
+  standardName: string;
+  longName: string;
+  comment: string;
+  units: string;
+};
+
 // ========== Helper functions ==========
 function normalizeText(value: any) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+function buildDirectionMetadata(raw: Record<string, unknown> | null | undefined): DirectionMetadata {
+  return {
+    standardName: normalizeText(raw?.standard_name),
+    longName: normalizeText(raw?.long_name),
+    comment: normalizeText(raw?.comment),
+    units: normalizeText(raw?.units),
+  };
+}
+function normalizeWaveDirectionForIcon(rawAngle: number, metadata: DirectionMetadata, offset = 0) {
+  let direction = ((rawAngle % 360) + 360) % 360;
+
+  const isFromDirection =
+    metadata.standardName.includes("from_direction") ||
+    metadata.longName.includes("from direction") ||
+    metadata.comment.includes("from direction");
+
+  if (isFromDirection) {
+    direction = (direction + 180) % 360;
+  }
+
+  const isClockwiseFromNorth =
+    metadata.comment.includes("clockwise from due north") ||
+    metadata.comment.includes("north=0") ||
+    metadata.units.includes("degree");
+
+  const iconAngle = isClockwiseFromNorth ? -direction : direction;
+  return ((iconAngle + offset) % 360 + 360) % 360;
 }
 function looksLikeTime(name: string, node: any) {
   const normalizedName = normalizeText(name);
@@ -73,6 +108,33 @@ function computeEdges(values: ArrayLike<number>) {
   for (let i = 1; i < values.length; i++) edges[i] = (values[i - 1] + values[i]) / 2;
   edges[values.length] = values[values.length - 1] + (values[values.length - 1] - values[values.length - 2]) / 2;
   return edges;
+}
+function assertFiniteNumber(name: string, value: number) {
+  if (!Number.isFinite(value)) {
+    throw new Error(`Invalid ${name}: ${String(value)}`);
+  }
+}
+function assertFiniteNumberArray(name: string, values: number[]) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error(`Invalid ${name}: empty array`);
+  }
+  for (let i = 0; i < values.length; i++) {
+    if (!Number.isFinite(values[i])) {
+      throw new Error(`Invalid ${name}[${i}]: ${String(values[i])}`);
+    }
+  }
+}
+function isFiniteBounds(bounds: any): bounds is { lonMin: number; lonMax: number; latMin: number; latMax: number } {
+  return (
+    bounds &&
+    Number.isFinite(bounds.lonMin) &&
+    Number.isFinite(bounds.lonMax) &&
+    Number.isFinite(bounds.latMin) &&
+    Number.isFinite(bounds.latMax)
+  );
+}
+function isNonDegenerateBounds(bounds: { lonMin: number; lonMax: number; latMin: number; latMax: number }) {
+  return bounds.lonMin !== bounds.lonMax && bounds.latMin !== bounds.latMax;
 }
 function isArrayMetadata(node: any) {
   return node && (node.node_type === "array" || Array.isArray(node.shape));
@@ -168,26 +230,81 @@ function buildInlineMetadataFromZarrV2(consolidated: any) {
 }
 function buildZarrUrl(datasetName: string, baseUrl?: string) {
   const DEFAULT_BASE = "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/";
-  const configured = baseUrl || process.env.NEXT_PUBLIC_ZARR_BASE_URL || DEFAULT_BASE;
-  return new URL(`${datasetName}/`, configured).toString();
+  const configured = (baseUrl || process.env.NEXT_PUBLIC_ZARR_BASE_URL || DEFAULT_BASE).trim();
+
+  const normalizedDataset = datasetName.replace(/^\/+/, "").replace(/\/+$/, "") + "/";
+
+  const joinPath = (basePath: string) => {
+    const baseNormalized = basePath.replace(/\/+$/, "") + "/";
+    return `${baseNormalized}${normalizedDataset}`;
+  };
+
+  // Support local/public datasets served by Next.js under the current origin.
+  // `new URL(relative, base)` requires an absolute base; so for relative bases
+  // (like "/"), we join paths directly.
+  if (configured.startsWith("/")) {
+    const relative = joinPath(configured);
+    if (typeof window !== "undefined" && window.location?.origin) {
+      return new URL(relative, window.location.origin).toString();
+    }
+    return relative;
+  }
+
+  // If it's not an absolute URL (no scheme), treat it as site-root relative.
+  // Examples: "zarr/", "./zarr/".
+  const hasScheme = /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(configured);
+  if (!hasScheme && !configured.startsWith("//")) {
+    const withoutDot = configured.replace(/^\.\/?/, "");
+    const relative = joinPath(`/${withoutDot}`);
+    if (typeof window !== "undefined" && window.location?.origin) {
+      return new URL(relative, window.location.origin).toString();
+    }
+    return relative;
+  }
+
+  // Absolute (or protocol-relative) base URL.
+  const absoluteBase = configured.startsWith("//")
+    ? typeof window !== "undefined"
+      ? `${window.location.protocol}${configured}`
+      : `https:${configured}`
+    : configured;
+
+  return new URL(normalizedDataset, absoluteBase).toString();
 }
 async function openDatasetStore(datasetName: string, baseUrl?: string) {
   const store = new FetchStore(buildZarrUrl(datasetName, baseUrl));
   return { store, sourceLabel: "Zarr store" };
 }
 async function fetchRootMetadata(store: any) {
-  const zarrV3 = await store.get("/zarr.json");
+  const tried: string[] = [];
+
+  const tryGet = async (key: string) => {
+    tried.push(key);
+    try {
+      return await store.get(key);
+    } catch {
+      return null;
+    }
+  };
+
+  // FetchStore (from @zarrita/storage) expects absolute paths (leading '/').
+  // If we pass a relative key like "zarr.json" or ".zmetadata", the internal
+  // resolver slices off the first character and we end up requesting
+  // "arr.json" or "zmetadata".
+  const zarrV3 = await tryGet("/zarr.json");
   if (zarrV3) {
     const meta = JSON.parse(new TextDecoder().decode(zarrV3));
     return { rootAttributes: meta?.attributes ?? {}, inlineMetadata: meta?.consolidated_metadata?.metadata ?? {} };
   }
-  const zarrV2 = await store.get("/.zmetadata");
+
+  const zarrV2 = (await tryGet("/.zmetadata")) ?? (await tryGet("/zmetadata"));
   if (zarrV2) {
     const meta = JSON.parse(new TextDecoder().decode(zarrV2));
     const consolidated = meta?.metadata ?? {};
     return { rootAttributes: consolidated[".zattrs"] ?? {}, inlineMetadata: buildInlineMetadataFromZarrV2(consolidated) };
   }
-  throw new Error("Unable to read Zarr metadata.");
+
+  throw new Error(`Unable to read Zarr metadata. Tried: ${tried.join(", ")}`);
 }
 function formatIsoDate(d: Date | null) {
   if (!d || isNaN(d.getTime())) return null;
@@ -227,6 +344,7 @@ export class ZarrOverlay {
   private config: ZarrLayerConfig;
   private dataset: any = null;
   private canvasRefs: Record<string, HTMLCanvasElement> = {};
+  private didAutoFitToData = false;
   private renderRequestId = 0;
   private renderTimeout: ReturnType<typeof setTimeout> | null = null;
   private renderInFlight = false;
@@ -338,6 +456,11 @@ export class ZarrOverlay {
   }
 
   private createBitmapLayer(id: string, image: HTMLCanvasElement, bounds: any) {
+    if (!isFiniteBounds(bounds) || !isNonDegenerateBounds(bounds)) {
+      // Avoid feeding Deck.gl invalid bounds which can trigger
+      // "Illegal attribute generated for positions".
+      return null;
+    }
     return new BitmapLayer({
       id,
       image,
@@ -423,18 +546,41 @@ export class ZarrOverlay {
     const [latRaw, lonRaw] = await Promise.all([zarritaGet(latArr), zarritaGet(lonArr)]);
     const latValues = Array.from(latRaw.data as ArrayLike<number>, Number);
     const lonValues = Array.from(lonRaw.data as ArrayLike<number>, Number);
+
+    // Deck.gl BitmapLayer bounds must be finite; validate coordinate vectors early.
+    assertFiniteNumberArray(`coordinate ${latName}`, latValues);
+    assertFiniteNumberArray(`coordinate ${lonName}`, lonValues);
+    if (latValues.length < 2 || lonValues.length < 2) {
+      throw new Error(`Coordinate arrays must have length >= 2 (lat=${latValues.length}, lon=${lonValues.length}).`);
+    }
+
+    const latStep = latValues[1] - latValues[0];
+    const lonStep = lonValues[1] - lonValues[0];
+    assertFiniteNumber("latitude step", latStep);
+    assertFiniteNumber("longitude step", lonStep);
+    if (latStep === 0 || lonStep === 0) {
+      throw new Error(`Invalid coordinate step (latStep=${latStep}, lonStep=${lonStep}).`);
+    }
     const latEdges = computeEdges(latValues);
     const lonEdges = computeEdges(lonValues);
     const lonMin = lonEdges ? Math.min(lonEdges[0], lonEdges[lonEdges.length-1]) : Math.min(lonValues[0], lonValues[lonValues.length-1]);
     const lonMax = lonEdges ? Math.max(lonEdges[0], lonEdges[lonEdges.length-1]) : Math.max(lonValues[0], lonValues[lonValues.length-1]);
     const splitLon = getSplitLongitude(lonMin, lonMax);
     const splitIdx = splitLon === null ? -1 : lonValues.findIndex((v: number) => v >= splitLon);
-    const visibleRowStart = Math.max(0, latValues.findIndex((v: number) => v >= -MAX_MERCATOR_LAT));
-    const visibleRowEnd = latValues.length - 1 - [...latValues].reverse().findIndex(v => v <= MAX_MERCATOR_LAT);
-    const safeStart = visibleRowStart >= 0 ? visibleRowStart : 0;
-    const safeEnd = visibleRowEnd >= safeStart ? visibleRowEnd : latValues.length - 1;
+    const firstVisible = latValues.findIndex((v: number) => v >= -MAX_MERCATOR_LAT);
+    const lastVisibleFromEnd = [...latValues].reverse().findIndex((v: number) => v <= MAX_MERCATOR_LAT);
+    const visibleRowStart = firstVisible === -1 ? 0 : firstVisible;
+    const visibleRowEnd = lastVisibleFromEnd === -1 ? latValues.length - 1 : latValues.length - 1 - lastVisibleFromEnd;
+
+    const safeStart = Math.max(0, Math.min(latValues.length - 1, visibleRowStart));
+    const safeEnd = Math.max(safeStart, Math.min(latValues.length - 1, visibleRowEnd));
     const latMin = latEdges ? Math.min(latEdges[safeStart], latEdges[safeEnd+1]) : Math.min(latValues[0], latValues[latValues.length-1]);
     const latMax = latEdges ? Math.max(latEdges[safeStart], latEdges[safeEnd+1]) : Math.max(latValues[0], latValues[latValues.length-1]);
+
+    assertFiniteNumber("latMin", latMin);
+    assertFiniteNumber("latMax", latMax);
+    assertFiniteNumber("lonMin", lonMin);
+    assertFiniteNumber("lonMax", lonMax);
     const safeSplit = splitIdx > 0 && splitIdx < lonValues.length ? splitIdx : null;
     const timeDimIndex = timeDim ? dimNames.indexOf(timeDim) : -1;
     const timeCount = timeDimIndex >= 0 ? Number(variable.shape?.[timeDimIndex] ?? 1) : 1;
@@ -448,6 +594,7 @@ export class ZarrOverlay {
       directionVariableName: this.config.directionVariable,
       variableLongName: varMeta?.attributes?.long_name ?? this.config.heightVariable,
       directionLongName: dirMeta?.attributes?.long_name ?? this.config.directionVariable,
+      directionMetadata: buildDirectionMetadata(dirMeta?.attributes),
       variableUnits: varMeta?.attributes?.units ?? "",
       datasetTitle: rootAttributes?.title ?? this.config.datasetName,
       sourceLabel,
@@ -473,6 +620,8 @@ export class ZarrOverlay {
       latEdges,
       lonEdges,
       latAscending: latValues[0] < latValues[latValues.length-1],
+      latStep,
+      lonStep,
       splitIndex: safeSplit,
       splitLongitude: splitLon,
       visibleRowStart: safeStart,
@@ -584,6 +733,14 @@ export class ZarrOverlay {
       const decoded = new Float32Array(width * height);
       const shouldComputeStats = !this.config.colorRange && !this.cachedStats;
       let minVal = Infinity, maxVal = -Infinity;
+
+      // Track the bounding box of finite pixels so we can auto-zoom sparse datasets
+      // (many chunks may be missing because they were never written when all-fill).
+      let dataMinX = Infinity;
+      let dataMaxX = -Infinity;
+      let dataMinY = Infinity;
+      let dataMaxY = -Infinity;
+
       for (let y = 0; y < height; y++) {
         for (let x = 0; x < width; x++) {
           const raw = getValue(x, y);
@@ -595,10 +752,50 @@ export class ZarrOverlay {
           const val = raw * dataset.scaleFactor + dataset.addOffset;
           decoded[idx] = val;
 
+          if (!this.didAutoFitToData) {
+            if (x < dataMinX) dataMinX = x;
+            if (x > dataMaxX) dataMaxX = x;
+            if (y < dataMinY) dataMinY = y;
+            if (y > dataMaxY) dataMaxY = y;
+          }
+
           if (shouldComputeStats) {
             if (val < minVal) minVal = val;
             if (val > maxVal) maxVal = val;
           }
+        }
+      }
+
+      // Auto-fit map once per layer so sparse local datasets become visible.
+      if (!this.didAutoFitToData && Number.isFinite(dataMinX) && dataMaxX >= dataMinX && dataMaxY >= dataMinY) {
+        try {
+          const x0 = Math.max(0, Math.min(width - 1, Math.floor(dataMinX)));
+          const x1 = Math.max(0, Math.min(width - 1, Math.ceil(dataMaxX)));
+          const y0 = Math.max(0, Math.min(height - 1, Math.floor(dataMinY)));
+          const y1 = Math.max(0, Math.min(height - 1, Math.ceil(dataMaxY)));
+
+          const lon0 = dataset.lonEdges ? dataset.lonEdges[x0] : dataset.lonValues[x0];
+          const lon1 = dataset.lonEdges ? dataset.lonEdges[x1 + 1] : dataset.lonValues[x1];
+          const lat0 = dataset.latEdges ? dataset.latEdges[y0] : dataset.latValues[y0];
+          const lat1 = dataset.latEdges ? dataset.latEdges[y1 + 1] : dataset.latValues[y1];
+
+          const lonMin = Math.min(lon0, lon1);
+          const lonMax = Math.max(lon0, lon1);
+          const latMin = Math.min(lat0, lat1);
+          const latMax = Math.max(lat0, lat1);
+
+          if (Number.isFinite(lonMin) && Number.isFinite(lonMax) && Number.isFinite(latMin) && Number.isFinite(latMax) && lonMin !== lonMax && latMin !== latMax) {
+            this.didAutoFitToData = true;
+            this.map.fitBounds(
+              [
+                [lonMin, clampLatitudeToMercator(latMin)],
+                [lonMax, clampLatitudeToMercator(latMax)],
+              ] as any,
+              { padding: 40, animate: true, maxZoom: 12 },
+            );
+          }
+        } catch {
+          // Ignore auto-fit failures; rendering can still proceed.
         }
       }
 
@@ -630,6 +827,10 @@ export class ZarrOverlay {
       const mercTop = latToMercatorY(dataset.bounds.latMax);
       const mercBottom = latToMercatorY(dataset.bounds.latMin);
       const latOrigin = dataset.latValues[0];
+      const latStep = Number(dataset.latStep ?? (dataset.latValues[1] - dataset.latValues[0]));
+      if (!Number.isFinite(latStep) || latStep === 0) {
+        throw new Error("Invalid latitude step for resampling.");
+      }
 
       const getInterpolated = (x: number, y: number) => {
         const x0 = Math.floor(x), y0 = Math.floor(y), x1 = x0+1, y1 = y0+1;
@@ -710,7 +911,7 @@ export class ZarrOverlay {
             dirVal = dirVal * dataset.directionScaleFactor + dataset.directionAddOffset;
             arrowPoints.push({
               position: [shiftedLon, lat],
-              angle: ((dirVal % 360) + 360) % 360,
+              angle: normalizeWaveDirectionForIcon(dirVal, dataset.directionMetadata),
             });
           }
         }
@@ -733,7 +934,7 @@ export class ZarrOverlay {
           const t = (row + 0.5) / targetHeight;
           const mercY = mercTop + (mercBottom - mercTop) * t;
           const lat = mercatorYToLat(mercY);
-          const srcY = dataset.latAscending ? (lat - latOrigin) / (dataset.latValues[1] - dataset.latValues[0]) : (latOrigin - lat) / (dataset.latValues[0] - dataset.latValues[1]);
+          const srcY = dataset.latAscending ? (lat - latOrigin) / latStep : (latOrigin - lat) / -latStep;
           if (srcY < dataset.visibleRowStart || srcY > dataset.visibleRowEnd) continue;
           const lowerOff = row * targetLowerWidth * 4;
           const upperOff = row * targetUpperWidth * 4;
@@ -761,10 +962,12 @@ export class ZarrOverlay {
         if (!this.mounted || requestId !== this.renderRequestId) return;
         const lowerBoundsVar = getWrappedBoundsVariants(dataset.lowerBounds, centerLng);
         const upperBoundsVar = getWrappedBoundsVariants(dataset.upperBounds, centerLng);
-        bitmapLayers = lowerBoundsVar.flatMap((b, i) => [
-          this.createBitmapLayer(`lower-${requestId}-${i}`, lowerCanvas, b),
-          this.createBitmapLayer(`upper-${requestId}-${i}`, upperCanvas, upperBoundsVar[i]),
-        ]);
+        bitmapLayers = lowerBoundsVar
+          .flatMap((b, i) => [
+            this.createBitmapLayer(`lower-${requestId}-${i}`, lowerCanvas, b),
+            this.createBitmapLayer(`upper-${requestId}-${i}`, upperCanvas, upperBoundsVar[i]),
+          ])
+          .filter(Boolean);
       } else if (showRaster) {
         const fullCanvas = this.ensureCanvas("full", targetFullWidth, targetHeight);
         const fullCtx = fullCanvas.getContext("2d")!;
@@ -773,7 +976,7 @@ export class ZarrOverlay {
           const t = (row + 0.5) / targetHeight;
           const mercY = mercTop + (mercBottom - mercTop) * t;
           const lat = mercatorYToLat(mercY);
-          const srcY = dataset.latAscending ? (lat - latOrigin) / (dataset.latValues[1] - dataset.latValues[0]) : (latOrigin - lat) / (dataset.latValues[0] - dataset.latValues[1]);
+          const srcY = dataset.latAscending ? (lat - latOrigin) / latStep : (latOrigin - lat) / -latStep;
           if (srcY < dataset.visibleRowStart || srcY > dataset.visibleRowEnd) continue;
           const rowOff = row * targetFullWidth * 4;
           for (let col = 0; col < targetFullWidth; col++) {
@@ -789,7 +992,9 @@ export class ZarrOverlay {
         fullCtx.putImageData(fullImg, 0, 0);
         if (!this.mounted || requestId !== this.renderRequestId) return;
         const boundsVar = getWrappedBoundsVariants(dataset.bounds, centerLng);
-        bitmapLayers = boundsVar.map((b, i) => this.createBitmapLayer(`full-${requestId}-${i}`, fullCanvas, b));
+        bitmapLayers = boundsVar
+          .map((b, i) => this.createBitmapLayer(`full-${requestId}-${i}`, fullCanvas, b))
+          .filter(Boolean);
       }
 
       if (!this.mounted || requestId !== this.renderRequestId) {

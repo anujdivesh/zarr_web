@@ -1,3 +1,5 @@
+import type { UgridLayerConfig } from "./UgridOverlay";
+
 export interface ZarrLayerConfig {
   type: "zarr";
   id: string;
@@ -27,14 +29,18 @@ export interface LayerDefinition {
 }
 
 // You can extend with other layer types (e.g., GeoJSON, vector tile)
-export type LayerConfig = ZarrLayerConfig; // | GeoJsonLayerConfig | ...
+export type LayerConfig = ZarrLayerConfig | UgridLayerConfig; // | GeoJsonLayerConfig | ...
+
+// Local/public option: any dataset placed under `public/<datasetName>/` can be
+// loaded via an API proxy to allow reading Zarr dotfiles (e.g. `.zmetadata`).
+const LOCAL_PUBLIC_ZARR_BASE_URL = "/api/zarr/";
 
 export const layersConfig: LayerConfig[] = [
   {
     type: "zarr",
     id: "wave-height",
     name: "Significant Wave Height + Direction",
-    datasetName: "latest_merged_v2.zarr",
+    datasetName: "wavewatch3.zarr",
     zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",
     heightVariable: "sig_wav_ht",
     directionVariable: "mn_wav_dir",
@@ -43,14 +49,25 @@ export const layersConfig: LayerConfig[] = [
   },
   {
     type: "zarr",
-    id: "wave-height-only",
-    name: "Significant Wave Height",
-    datasetName: "latest_merged_v2.zarr",
-    zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",
-    heightVariable: "sig_wav_ht",
-    directionVariable: undefined,
+    id: "inundation-depth2",
+    name: "Raro Time Inundation Depth",
+    datasetName: "sfincs_h_forecast.zarr",
+    zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",    // or wherever your API routes serve the Zarr
+    heightVariable: "h",
+    // Remove colorRange and colormap temporarily
     colorRange: { min: 0, max: 4 },
-    colormap: "red-blue",
+    colormap: "jet",
+    showRaster: true,
+    showArrows: false,
+  },
+  {
+    type: "zarr",
+    id: "inundation-depth",
+    name: "Inundation Depth",
+    datasetName: "raro_inun2.zarr",
+    zarrBaseUrl: "/api/zarr/",    // or wherever your API routes serve the Zarr
+    heightVariable: "h",
+    // Remove colorRange and colormap temporarily
     showRaster: true,
     showArrows: false,
   },
@@ -64,6 +81,19 @@ export const layersConfig: LayerConfig[] = [
     directionVariable: "mn_wav_dir",
     showRaster: false,
     showArrows: true,
+  },
+  {
+    type: "ugrid",
+    id: "rarotonga-ugrid",
+    name: "Rarotonga UGRID Waves",
+    datasetName: "rarotonga_ugrid.zarr",
+    zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",
+    variable: "hs",
+    directionVariable: "dirm",
+    colorRange: { min: 0, max: 5 },
+    colormap: "jet",
+    opacity: 0.8,
+    arrowSize: 18,
   },
   // Add another Zarr dataset later:
   // {
