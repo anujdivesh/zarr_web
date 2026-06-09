@@ -6,6 +6,7 @@ import maplibregl from "maplibre-gl";
 import FetchStore from "@zarrita/storage/fetch";
 import { get as zarritaGet, open as openZarrita } from "zarrita";
 import { getColormap } from "./colormaps";
+import type { PointTimeseries } from "./TimeseriesPopup";
 
 // ========== Constants ==========
 const MAX_MERCATOR_LAT = (Math.atan(Math.sinh(Math.PI)) * 180) / Math.PI;
@@ -340,6 +341,18 @@ async function fetchRootMetadata(store: any) {
   }
 
   throw new Error(`Unable to read Zarr metadata. Tried: ${tried.join(", ")}`);
+}
+function nearestIndex(values: number[], target: number) {
+  let best = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < values.length; i++) {
+    const dist = Math.abs(values[i] - target);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = i;
+    }
+  }
+  return best;
 }
 function formatIsoDate(d: Date | null) {
   if (!d || isNaN(d.getTime())) return null;
@@ -1101,6 +1114,89 @@ export class ZarrOverlay {
         this.requestRender();
       }
     }
+  }
+
+  // Reads the full time series of the layer's variable(s) at a clicked point.
+  // Returns null when the point falls outside the dataset's spatial coverage.
+  public async getTimeseriesAtPoint(lng: number, lat: number): Promise<PointTimeseries | null> {
+    const dataset = await this.ensureDatasetLoaded();
+
+    const latValues: number[] = dataset.latValues;
+    const lonValues: number[] = dataset.lonValues;
+
+    // Reject clicks clearly outside the latitude band.
+    const latStep = Math.abs(dataset.latStep);
+    const latLo = Math.min(latValues[0], latValues[latValues.length - 1]) - latStep;
+    const latHi = Math.max(latValues[0], latValues[latValues.length - 1]) + latStep;
+    if (lat < latLo || lat > latHi) return null;
+
+    // Longitude may be stored as 0..360 or -180..180; pick the wrapped variant
+    // that lands inside the dataset's longitude span.
+    const lonStep = Math.abs(dataset.lonStep);
+    const lonLo = Math.min(lonValues[0], lonValues[lonValues.length - 1]) - lonStep;
+    const lonHi = Math.max(lonValues[0], lonValues[lonValues.length - 1]) + lonStep;
+    const lonCandidate = [lng, lng + 360, lng - 360].find((v) => v >= lonLo && v <= lonHi);
+    if (lonCandidate === undefined) return null;
+
+    const latIdx = nearestIndex(latValues, lat);
+    const lonIdx = nearestIndex(lonValues, lonCandidate);
+
+    const buildPointSelection = (dimNames: string[], timeDimName: string | null) =>
+      dimNames.map((dim) => {
+        if (dim === timeDimName) return null; // full time axis
+        if (dim === dataset.latName) return latIdx;
+        if (dim === dataset.lonName) return lonIdx;
+        if (dim === dataset.depthDimensionName) return this.depthIndex;
+        return 0;
+      });
+
+    const heightSelection = buildPointSelection(dataset.dimensionNames, dataset.timeDimensionName);
+    const dirSelection = dataset.directionVariable
+      ? buildPointSelection(dataset.directionDimensionNames, dataset.directionTimeDimensionName)
+      : null;
+
+    const [heightResult, dirResult] = await Promise.all([
+      zarritaGet(dataset.variable, heightSelection),
+      dirSelection ? zarritaGet(dataset.directionVariable, dirSelection) : Promise.resolve(null),
+    ]);
+
+    const decode = (raw: number, scale: number, offset: number, missing: number | null) => {
+      if (!Number.isFinite(raw) || (missing !== null && raw === missing)) return NaN;
+      return raw * scale + offset;
+    };
+
+    const heightValues = Array.from(heightResult.data as ArrayLike<number>, (raw) =>
+      decode(Number(raw), dataset.scaleFactor, dataset.addOffset, dataset.missingValue),
+    );
+
+    const timeLabels = heightValues.map((_, i) => buildTimeLabel(dataset, i));
+
+    const variables: PointTimeseries["variables"] = [
+      {
+        name: dataset.variableLongName || dataset.variableName,
+        units: dataset.variableUnits || "",
+        values: heightValues,
+      },
+    ];
+
+    if (dirResult && dataset.directionVariable) {
+      const dirValues = Array.from(dirResult.data as ArrayLike<number>, (raw) =>
+        decode(Number(raw), dataset.directionScaleFactor, dataset.directionAddOffset, dataset.directionMissingValue),
+      );
+      variables.push({
+        name: dataset.directionLongName || dataset.directionVariableName,
+        units: dataset.directionMetadata?.units || "degree",
+        values: dirValues,
+        isDirection: true,
+      });
+    }
+
+    return {
+      lon: lonValues[lonIdx],
+      lat: latValues[latIdx],
+      timeLabels,
+      variables,
+    };
   }
 
   // Public methods

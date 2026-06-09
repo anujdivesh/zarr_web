@@ -6,7 +6,59 @@ import { layersConfig, LayerConfig } from "@/lib/layers.config";
 import { UgridOverlay } from "@/lib/UgridOverlay";
 import { WindAnimationOverlay } from "@/lib/WindAnimationOverlay";
 import { ZarrOverlay } from "@/lib/zarrOverlay";
+import { TimeseriesPopup, TimeseriesProvider } from "@/lib/TimeseriesPopup";
 import "maplibre-gl/dist/maplibre-gl.css";
+
+const rasterStyle = (tiles: string[], attribution: string): maplibregl.StyleSpecification => ({
+  version: 8,
+  sources: {
+    basemap: { type: "raster", tiles, tileSize: 256, attribution },
+  },
+  layers: [{ id: "basemap", type: "raster", source: "basemap" }],
+});
+
+type Basemap = { id: string; name: string; style: maplibregl.StyleSpecification | string };
+
+const basemaps: Basemap[] = [
+  {
+    id: "satellite",
+    name: "Satellite",
+    style: rasterStyle(
+      ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+      "&copy; Esri, Maxar, Earthstar Geographics",
+    ),
+  },
+  {
+    id: "maplibre",
+    name: "MapLibre",
+    style: "https://demotiles.maplibre.org/style.json",
+  },
+  {
+    id: "osm",
+    name: "Streets",
+    style: rasterStyle(
+      ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+      "&copy; OpenStreetMap contributors",
+    ),
+  },
+  
+  {
+    id: "light",
+    name: "Light",
+    style: rasterStyle(
+      ["https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}.png"],
+      "&copy; OpenStreetMap contributors &copy; CARTO",
+    ),
+  },
+  {
+    id: "dark",
+    name: "Dark",
+    style: rasterStyle(
+      ["https://basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}.png"],
+      "&copy; OpenStreetMap contributors &copy; CARTO",
+    ),
+  },
+];
 
 type OverlayController = {
   destroy: () => void;
@@ -14,6 +66,7 @@ type OverlayController = {
   setDepthIndex?: (value: number) => void;
   startPlayback: (intervalMs?: number) => void;
   stopPlayback: () => void;
+  getTimeseriesAtPoint?: TimeseriesProvider["getTimeseriesAtPoint"];
   onLoadingChange?: (loading: boolean) => void;
   onErrorChange?: (error: string | null) => void;
   onTimeChange?: (label: string, idx: number, max: number) => void;
@@ -26,7 +79,9 @@ export default function Home() {
   const mapRef = useRef<maplibregl.Map | null>(null);
   const overlayRef = useRef<OverlayController | null>(null);
   const windRef = useRef<WindAnimationOverlay | null>(null);
+  const timeseriesPopupRef = useRef<TimeseriesPopup | null>(null);
   const [selectedLayerId, setSelectedLayerId] = useState(layersConfig[0].id);
+  const [selectedBasemap, setSelectedBasemap] = useState(basemaps[0].id);
   const [showWind, setShowWind] = useState(true);
   const [depth, setDepth] = useState({ levels: [] as number[], index: 0, units: "" });
   const depthIndexRef = useRef(0);
@@ -48,18 +103,7 @@ export default function Home() {
     if (!mapContainer.current || mapRef.current) return;
     const map = new maplibregl.Map({
       container: mapContainer.current,
-      style: {
-        version: 8,
-        sources: {
-          osm: {
-            type: "raster",
-            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-            tileSize: 256,
-            attribution: "&copy; OpenStreetMap contributors",
-          },
-        },
-        layers: [{ id: "osm", type: "raster", source: "osm" }],
-      },
+      style: basemaps[0].style,
       center: [0, 0],
       zoom: 1.3,
       maxPitch: 0,
@@ -67,8 +111,35 @@ export default function Home() {
     });
     map.addControl(new maplibregl.NavigationControl(), "top-left");
     mapRef.current = map;
-    return () => map.remove();
+
+    // Click anywhere to inspect the active layer's full time series at that point.
+    timeseriesPopupRef.current = new TimeseriesPopup(map, () => {
+      const overlay = overlayRef.current;
+      return overlay && typeof overlay.getTimeseriesAtPoint === "function"
+        ? (overlay as TimeseriesProvider)
+        : null;
+    });
+
+    return () => {
+      timeseriesPopupRef.current?.destroy();
+      timeseriesPopupRef.current = null;
+      map.remove();
+    };
   }, []);
+
+  // Swap the basemap style. Overlays live on separate deck.gl/canvas layers,
+  // so they survive setStyle and don't need to be rebuilt here. The map is
+  // initialised with basemaps[0], so skip the first run to avoid a reload.
+  const didInitBasemap = useRef(false);
+  useEffect(() => {
+    if (!mapRef.current) return;
+    if (!didInitBasemap.current) {
+      didInitBasemap.current = true;
+      return;
+    }
+    const basemap = basemaps.find(b => b.id === selectedBasemap);
+    if (basemap) mapRef.current.setStyle(basemap.style);
+  }, [selectedBasemap]);
 
   // Switch overlay when layer selection changes
   useEffect(() => {
@@ -159,6 +230,27 @@ export default function Home() {
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative" }}>
       <div ref={mapContainer} style={{ position: "absolute", inset: 0 }} />
+      <div style={{ position: "absolute", left: 16, bottom: 16, zIndex: 10, padding: 8, borderRadius: 8, background: "rgba(15,23,42,0.9)", color: "#f8fafc", display: "flex", flexDirection: "column", gap: 4 }}>
+        <div style={{ fontSize: 11, fontWeight: "bold", opacity: 0.7, textTransform: "uppercase", letterSpacing: 0.5 }}>Basemap</div>
+        {basemaps.map(b => (
+          <button
+            key={b.id}
+            onClick={() => setSelectedBasemap(b.id)}
+            style={{
+              padding: "4px 10px",
+              fontSize: 13,
+              textAlign: "left",
+              border: "none",
+              borderRadius: 4,
+              cursor: "pointer",
+              background: selectedBasemap === b.id ? "#2563eb" : "rgba(255,255,255,0.1)",
+              color: "#f8fafc",
+            }}
+          >
+            {b.name}
+          </button>
+        ))}
+      </div>
       <div style={{ position: "absolute", top: 16, right: 16, zIndex: 10, background: "white", padding: 8, borderRadius: 8 }}>
         <select value={selectedLayerId} onChange={e => setSelectedLayerId(e.target.value)}>
           {layersConfig.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
@@ -169,9 +261,9 @@ export default function Home() {
               type="checkbox"
               checked={showWind}
               onChange={(e) => setShowWind(e.target.checked)}
-              style={{ marginRight: 6 }}
+              style={{ marginRight: 6, color:'black' }}
             />
-            Flow particles
+            <span style={{color:'black' }}>Flow particles</span>
           </label>
         )}
       </div>

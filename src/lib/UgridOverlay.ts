@@ -5,6 +5,7 @@ import type { Map } from "maplibre-gl";
 import FetchStore from "@zarrita/storage/fetch";
 import { get as zarritaGet, open as openZarrita } from "zarrita";
 import { getColormap } from "./colormaps";
+import type { PointTimeseries } from "./TimeseriesPopup";
 
 type MeshNode = [number, number];
 type TrianglePolygon = [MeshNode, MeshNode, MeshNode];
@@ -525,6 +526,69 @@ export class UgridOverlay {
         this.onLoadingChange?.(false);
       }
     }
+  }
+
+  // Reads the full time series of the layer's variable(s) at the mesh node
+  // nearest to a clicked point. Returns null when the mesh is too far away.
+  public async getTimeseriesAtPoint(lng: number, lat: number): Promise<PointTimeseries | null> {
+    await this.loadDatasetMetadata();
+    if (!this.variableArray || !this.dataset) return null;
+
+    const nodes = this.dataset.nodes as MeshNode[];
+    if (!nodes.length) return null;
+
+    // Reject clicks well outside the mesh bounding box.
+    const [[lonMin, latMin], [lonMax, latMax]] = this.dataset.bounds;
+    const margin = Math.max(lonMax - lonMin, latMax - latMin) * 0.05;
+    if (lng < lonMin - margin || lng > lonMax + margin || lat < latMin - margin || lat > latMax + margin) {
+      return null;
+    }
+
+    // Find the nearest mesh node (squared distance is enough for ranking).
+    let bestNode = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < nodes.length; i++) {
+      const dLon = nodes[i][0] - lng;
+      const dLat = nodes[i][1] - lat;
+      const dist = dLon * dLon + dLat * dLat;
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestNode = i;
+      }
+    }
+
+    const [heightRaw, dirRaw] = await Promise.all([
+      zarritaGet(this.variableArray, [null, bestNode]), // (time, mesh_node) -> time
+      this.directionArray ? zarritaGet(this.directionArray, [null, bestNode]) : Promise.resolve(null),
+    ]);
+
+    const toValues = (raw: ArrayLike<number>) =>
+      Array.from(raw, (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : NaN;
+      });
+
+    const heightValues = toValues(heightRaw.data as ArrayLike<number>);
+    const timeLabels = heightValues.map((_, i) => `Timestep ${i + 1}`);
+
+    const variables: PointTimeseries["variables"] = [
+      { name: this.config.variable, units: "m", values: heightValues },
+    ];
+    if (dirRaw && this.config.directionVariable) {
+      variables.push({
+        name: this.config.directionVariable,
+        units: "degree",
+        values: toValues(dirRaw.data as ArrayLike<number>),
+        isDirection: true,
+      });
+    }
+
+    return {
+      lon: nodes[bestNode][0],
+      lat: nodes[bestNode][1],
+      timeLabels,
+      variables,
+    };
   }
 
   public setTimeIndex(index: number) {

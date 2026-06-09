@@ -1,8 +1,6 @@
 import type { UgridLayerConfig } from "./UgridOverlay";
 import type { WindConfig } from "./WindAnimationOverlay";
 
-const APP_BASE_PATH = "/zarr-web";
-
 export interface ZarrLayerConfig {
   type: "zarr";
   id: string;
@@ -35,17 +33,13 @@ export interface LayerDefinition {
 // You can extend with other layer types (e.g., GeoJSON, vector tile)
 export type LayerConfig = ZarrLayerConfig | UgridLayerConfig; // | GeoJsonLayerConfig | ...
 
-// Local/public option: any dataset placed under `public/<datasetName>/` can be
-// loaded via an API proxy to allow reading Zarr dotfiles (e.g. `.zmetadata`).
-const LOCAL_PUBLIC_ZARR_BASE_URL = `${APP_BASE_PATH}/api/zarr/`;
-
 export const layersConfig: LayerConfig[] = [
   {
     type: "zarr",
     id: "croco-sea-velocity",
     name: "CROCO Sea Water Velocity (speed + u/v particles)",
-    datasetName: "zarr-data/d1_temp_salt_uv_z_all.zarr",
-    zarrBaseUrl: LOCAL_PUBLIC_ZARR_BASE_URL,
+    datasetName: "d1_temp_salt_uv_z_all.zarr",
+    zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",
     // Raster shows current speed magnitude (sqrt(u^2+v^2)); particles animate u/v.
     heightVariable: "current_speed",
     colorRange: { min: 0, max: 0.8 },
@@ -53,8 +47,8 @@ export const layersConfig: LayerConfig[] = [
     showRaster: true,
     showArrows: false,
     windAnimation: {
-      datasetName: "zarr-data/d1_temp_salt_uv_z_all.zarr",
-      zarrBaseUrl: LOCAL_PUBLIC_ZARR_BASE_URL,
+      datasetName: "d1_temp_salt_uv_z_all.zarr",
+      zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",
       uVariable: "u",
       vVariable: "v",
       latVariable: "lat",
@@ -103,7 +97,7 @@ export const layersConfig: LayerConfig[] = [
     showRaster: true,
     showArrows: false,
   },
-  {
+ /*{
     type: "zarr",
     id: "wave-direction-only",
     name: "WAVEWATCH3 Mean Wave Direction (arrows)",
@@ -113,7 +107,7 @@ export const layersConfig: LayerConfig[] = [
     directionVariable: "mn_wav_dir",
     showRaster: false,
     showArrows: true,
-  },
+  },*/
   {
     type: "ugrid",
     id: "rarotonga-ugrid",
@@ -131,8 +125,8 @@ export const layersConfig: LayerConfig[] = [
     type: "zarr",
     id: "croco-temperature",
     name: "CROCO Sea Water Temperature (z-levels)",
-    datasetName: "zarr-data/d1_temp_salt_uv_z_all.zarr",
-    zarrBaseUrl: LOCAL_PUBLIC_ZARR_BASE_URL,
+    datasetName: "d1_temp_salt_uv_z_all.zarr",
+    zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",
     heightVariable: "temperature",
     colorRange: { min: 20, max: 30 },
     colormap: "jet",
