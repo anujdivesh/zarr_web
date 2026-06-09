@@ -8,11 +8,22 @@ export interface WindConfig {
   zarrBaseUrl: string;
   speedVariable?: string;
   directionVariable?: string;
+  // Alternative to speed+direction: supply eastward (u) and northward (v)
+  // velocity components directly (e.g. ocean current u/v). When both are set
+  // they take precedence over speedVariable/directionVariable.
+  uVariable?: string;
+  vVariable?: string;
   latVariable?: string;
   lonVariable?: string;
   speedFactor?: number;
   particleCount?: number;
   particleSize?: number;
+  // Colour the particles by speed using this colormap (defaults to "jet" so the
+  // particles match the raster). Speeds are normalized to [minSpeed, maxSpeed];
+  // when maxSpeed is omitted it is derived from the data each time step.
+  colormap?: string;
+  minSpeed?: number;
+  maxSpeed?: number;
 }
 
 type DirectionMetadata = {
@@ -39,6 +50,9 @@ type RectilinearWindField = {
   lonWraps: boolean;
   timeCount: number;
   directionMetadata: DirectionMetadata;
+  // Lower/upper speed bounds used to normalize speed -> colour ramp.
+  speedFloor: number;
+  speedScale: number;
 };
 
 type WindParticle = {
@@ -160,9 +174,18 @@ function findAxis(dimensionNames: string[], candidates: string[]) {
   return dimensionNames.findIndex((name) => candidates.includes(normalizeText(name)));
 }
 
-function buildSliceSelection(dimensionNames: string[], timeAxis: number, latAxis: number, lonAxis: number, timeIdx: number) {
+function buildSliceSelection(
+  dimensionNames: string[],
+  timeAxis: number,
+  latAxis: number,
+  lonAxis: number,
+  timeIdx: number,
+  depthAxis = -1,
+  depthIdx = 0,
+) {
   return dimensionNames.map((_, index) => {
     if (index === timeAxis) return timeIdx;
+    if (index === depthAxis) return depthIdx;
     if (index === latAxis || index === lonAxis) return null;
     return 0;
   });
@@ -183,6 +206,7 @@ export class WindAnimationOverlay {
   private validCells: Set<number> | null = null;
   private animationFrame: number | null = null;
   private timeIndex = 0;
+  private depthIndex = 0;
   private lastTimestamp = 0;
   private isPanning = false;
   private canvas: HTMLCanvasElement;
@@ -206,7 +230,9 @@ export class WindAnimationOverlay {
     this.canvas.style.position = "absolute";
     this.canvas.style.inset = "0";
     this.canvas.style.pointerEvents = "none";
-    this.canvas.style.zIndex = "999";
+    // Sit above the deck.gl raster overlay (added as a maplibre control) and any
+    // other map chrome so the flow streaks are always visible.
+    this.canvas.style.zIndex = "10000";
     this.context = this.canvas.getContext("2d", { alpha: true })!;
 
     const container = this.map.getContainer();
@@ -254,50 +280,89 @@ export class WindAnimationOverlay {
     const group = await openZarrita(store, { kind: "group" });
     const latName = this.config.latVariable ?? "lat";
     const lonName = this.config.lonVariable ?? "lon";
+    // Two ways to describe the flow field:
+    //   * speed + direction (waves/wind), or
+    //   * eastward (u) + northward (v) components (ocean currents).
+    // We load whichever pair is configured, then normalize everything into the
+    // internal speed/direction representation the rest of the class expects.
+    const useComponents = Boolean(this.config.uVariable && this.config.vVariable);
     const speedName = this.config.speedVariable ?? "sig_wav_ht";
     const directionName = this.config.directionVariable ?? "mn_wav_dir";
+    const primaryName = useComponents ? this.config.uVariable! : speedName;
+    const secondaryName = useComponents ? this.config.vVariable! : directionName;
 
-    const [latArr, lonArr, speedArr, directionArr] = await Promise.all([
+    const [latArr, lonArr, primaryArr, secondaryArr] = await Promise.all([
       openZarrita(group.resolve(latName), { kind: "array" }),
       openZarrita(group.resolve(lonName), { kind: "array" }),
-      openZarrita(group.resolve(speedName), { kind: "array" }),
-      openZarrita(group.resolve(directionName), { kind: "array" }),
+      openZarrita(group.resolve(primaryName), { kind: "array" }),
+      openZarrita(group.resolve(secondaryName), { kind: "array" }),
     ]);
     const [lat, lon] = await Promise.all([
       zarritaGet(latArr),
       zarritaGet(lonArr),
     ]);
 
-    const speedMeta = metadata?.[`${speedName}/.zattrs`] ?? null;
-    const directionMeta = metadata?.[`${directionName}/.zattrs`] ?? null;
-    const speedDims = getDimensionNames(speedMeta, speedName, speedArr.shape);
-    const speedTimeAxis = inferTimeAxis(speedDims);
+    const primaryMeta = metadata?.[`${primaryName}/.zattrs`] ?? null;
+    const secondaryMeta = metadata?.[`${secondaryName}/.zattrs`] ?? null;
+    const primaryDims = getDimensionNames(primaryMeta, primaryName, primaryArr.shape);
+    const speedTimeAxis = inferTimeAxis(primaryDims);
     const latAxis = (() => {
-      const explicit = findAxis(speedDims, [normalizeText(latName), "lat", "latitude"]);
+      const explicit = findAxis(primaryDims, [normalizeText(latName), "lat", "latitude"]);
       if (explicit >= 0) return explicit;
-      return speedDims.length >= 2 ? speedDims.length - 2 : -1;
+      return primaryDims.length >= 2 ? primaryDims.length - 2 : -1;
     })();
     const lonAxis = (() => {
-      const explicit = findAxis(speedDims, [normalizeText(lonName), "lon", "longitude"]);
+      const explicit = findAxis(primaryDims, [normalizeText(lonName), "lon", "longitude"]);
       if (explicit >= 0) return explicit;
-      return speedDims.length >= 1 ? speedDims.length - 1 : -1;
+      return primaryDims.length >= 1 ? primaryDims.length - 1 : -1;
     })();
 
-    const speedSelection = buildSliceSelection(speedDims, speedTimeAxis, latAxis, lonAxis, timeIdx);
+    // Select the active depth level (if the field has one), otherwise any extra
+    // axes are pinned to index 0 by buildSliceSelection.
+    const depthAxis = findAxis(primaryDims, ["depth", "z", "zlev", "lev", "level", "height"]);
+    const depthIdx = depthAxis >= 0 ? Math.max(0, Math.min(this.depthIndex, Number(primaryArr.shape?.[depthAxis] ?? 1) - 1)) : 0;
+    const dataSelection = buildSliceSelection(primaryDims, speedTimeAxis, latAxis, lonAxis, timeIdx, depthAxis, depthIdx);
 
-    const [speed, direction] = await Promise.all([
-      zarritaGet(speedArr, speedSelection),
-      zarritaGet(directionArr, speedSelection),
+    const [primary, secondary] = await Promise.all([
+      zarritaGet(primaryArr, dataSelection),
+      zarritaGet(secondaryArr, dataSelection),
     ]);
 
-    if (!speed?.data || !direction?.data) {
-      throw new Error(`Unable to load wind slices for ${speedName}/${directionName}.`);
+    if (!primary?.data || !secondary?.data) {
+      throw new Error(`Unable to load flow slices for ${primaryName}/${secondaryName}.`);
     }
 
     const latValues = Array.from(lat.data as ArrayLike<number>, Number);
     const lonValues = Array.from(lon.data as ArrayLike<number>, Number);
-    const speedValues = Array.from(speed.data as ArrayLike<number>, Number);
-    const directionValues = Array.from(direction.data as ArrayLike<number>, Number);
+
+    let speedValues: number[];
+    let directionValues: number[];
+    let directionMetadata: DirectionMetadata;
+    if (useComponents) {
+      // Convert (u, v) into the magnitude + compass heading that getWindAt()
+      // re-expands later: heading = atan2(eastward, northward), degrees clockwise
+      // from north, so getWindAt's u = speed·sin(h), v = speed·cos(h) round-trips.
+      const uVals = Array.from(primary.data as ArrayLike<number>, Number);
+      const vVals = Array.from(secondary.data as ArrayLike<number>, Number);
+      speedValues = new Array(uVals.length);
+      directionValues = new Array(uVals.length);
+      for (let i = 0; i < uVals.length; i++) {
+        const uu = uVals[i];
+        const vv = vVals[i];
+        if (Number.isFinite(uu) && Number.isFinite(vv)) {
+          speedValues[i] = Math.hypot(uu, vv);
+          directionValues[i] = ((Math.atan2(uu, vv) * 180) / Math.PI + 360) % 360;
+        } else {
+          speedValues[i] = NaN;
+          directionValues[i] = 0;
+        }
+      }
+      directionMetadata = buildDirectionMetadata(null);
+    } else {
+      speedValues = Array.from(primary.data as ArrayLike<number>, Number);
+      directionValues = Array.from(secondary.data as ArrayLike<number>, Number);
+      directionMetadata = buildDirectionMetadata(secondaryMeta);
+    }
     const width = lonValues.length;
     const height = latValues.length;
 
@@ -308,15 +373,31 @@ export class WindAnimationOverlay {
     const latMax = Math.max(...latValues);
     this.dataBounds = { lonMin, lonMax, latMin, latMax };
 
-    // Build a set of indices that have finite, non‑zero wind speed
+    // Build a set of indices that have finite, non‑zero wind speed, and gather
+    // the finite speeds so we can normalize the colour ramp to this time step.
     const validSet = new Set<number>();
+    const finiteSpeeds: number[] = [];
     for (let i = 0; i < speedValues.length; i++) {
       const speed = speedValues[i];
       if (Number.isFinite(speed) && speed > 0) {
         validSet.add(i);
+        finiteSpeeds.push(speed);
       }
     }
     this.validCells = validSet;
+
+    // Normalize speed -> colour. Use the configured range when provided,
+    // otherwise derive a robust max (98th percentile) so a few outliers don't
+    // wash out the ramp.
+    const speedFloor = this.config.minSpeed ?? 0;
+    let speedScale = this.config.maxSpeed ?? 0;
+    if (!speedScale) {
+      if (finiteSpeeds.length) {
+        const sorted = [...finiteSpeeds].sort((a, b) => a - b);
+        speedScale = sorted[Math.floor(sorted.length * 0.98)] ?? sorted[sorted.length - 1];
+      }
+      speedScale = Math.max(speedScale, speedFloor + 1e-6);
+    }
 
     const lonStep = width > 1 ? Math.abs(lonMax - lonMin) / (width - 1) : 1;
     const latStep = height > 1 ? Math.abs(latMax - latMin) / (height - 1) : 1;
@@ -339,8 +420,10 @@ export class WindAnimationOverlay {
       lonStepSigned,
       latStepSigned,
       lonWraps,
-      timeCount: Number(speedArr.shape?.[speedTimeAxis >= 0 ? speedTimeAxis : 0] ?? 1),
-      directionMetadata: buildDirectionMetadata(directionMeta),
+      timeCount: Number(primaryArr.shape?.[speedTimeAxis >= 0 ? speedTimeAxis : 0] ?? 1),
+      directionMetadata,
+      speedFloor,
+      speedScale,
     };
   }
 
@@ -538,17 +621,34 @@ export class WindAnimationOverlay {
 
   private drawSegments(segments: Array<{ x0: number; y0: number; x1: number; y1: number; speed: number }>) {
     const particleSize = this.config.particleSize ?? 3;
+    const floor = this.windField?.speedFloor ?? 0;
+    const scale = this.windField?.speedScale ?? 1;
+    const range = Math.max(scale - floor, 1e-6);
+
+    // Bright streaks drawn additively ("lighter") so they glow on top of the
+    // coloured speed raster instead of blending into a same-coloured background.
+    // Speed is encoded by brightness + thickness (streak length already scales
+    // with speed, since motion is proportional to the u/v vector).
+    this.context.save();
+    this.context.globalCompositeOperation = "lighter";
+    this.context.lineCap = "round";
+    this.context.lineJoin = "round";
     for (const seg of segments) {
-      const alpha = Math.min(0.98, 0.45 + seg.speed * 0.12);
-      const lineWidth = Math.min(3.2, Math.max(1.1, particleSize * 0.6));
+      const t = Math.max(0, Math.min(1, (seg.speed - floor) / range));
+      const alpha = 0.3 + 0.65 * t;
+      const lineWidth = Math.max(0.8, particleSize * (0.5 + 0.9 * t));
+      // Near-white with a faint warm shift at high speed for a sense of energy.
+      const g = Math.round(255 - 40 * t);
+      const b = Math.round(255 - 90 * t);
+
       this.context.beginPath();
       this.context.moveTo(seg.x0, seg.y0);
       this.context.lineTo(seg.x1, seg.y1);
-      this.context.strokeStyle = `rgba(120, 220, 255, ${alpha})`;
+      this.context.strokeStyle = `rgba(255, ${g}, ${b}, ${alpha})`;
       this.context.lineWidth = lineWidth;
-      this.context.lineCap = "round";
       this.context.stroke();
     }
+    this.context.restore();
   }
 
   private animate = (now: number) => {
@@ -556,13 +656,16 @@ export class WindAnimationOverlay {
     const delta = Math.min(0.033, (now - this.lastTimestamp) / 1000);
     this.lastTimestamp = now;
 
-    // While panning/zooming, clear each frame (no trail) so particles track the
-    // map cleanly without smearing; otherwise fade for the trail effect.
+    // While the map is actively panning/zooming, skip the (expensive) per-particle
+    // project/unproject work entirely and just clear the canvas — this keeps map
+    // interaction smooth. Particles resume (and reseed) on moveend.
     if (this.isPanning) {
       this.clearCanvas();
-    } else {
-      this.fadeFrame();
+      this.animationFrame = requestAnimationFrame(this.animate);
+      return;
     }
+
+    this.fadeFrame();
     const segments = this.updateParticles(delta);
     this.drawSegments(segments);
     this.animationFrame = requestAnimationFrame(this.animate);
@@ -578,6 +681,15 @@ export class WindAnimationOverlay {
   public setTimeIndex(index: number) {
     this.timeIndex = index;
     this.loadWindData(index).then(() => {
+      this.seedParticles(true);
+      this.ensureVisibleParticles();
+    });
+  }
+
+  public setDepthIndex(index: number) {
+    this.depthIndex = Math.max(0, index);
+    // Reload the flow field at the new depth, then reseed so particles reflect it.
+    this.loadWindData(this.timeIndex).then(() => {
       this.seedParticles(true);
       this.ensureVisibleParticles();
     });

@@ -76,12 +76,38 @@ function looksLikeTime(name: string, node: any) {
 function inferTimeDimensionName(dimensionNames: string[], metadata: any) {
   return dimensionNames.find((dim) => looksLikeTime(dim, metadata?.[dim])) ?? null;
 }
-function buildSliceSelection(dimensionNames: string[], latName: string, lonName: string, timeDimName: string | null, timeIndex: number) {
+function buildSliceSelection(
+  dimensionNames: string[],
+  latName: string,
+  lonName: string,
+  timeDimName: string | null,
+  timeIndex: number,
+  depthDimName: string | null = null,
+  depthIndex = 0,
+) {
   return dimensionNames.map((dim) => {
     if (dim === latName || dim === lonName) return null;
     if (timeDimName && dim === timeDimName) return timeIndex;
+    if (depthDimName && dim === depthDimName) return depthIndex;
     return 0;
   });
+}
+
+const DEPTH_DIMENSION_NAMES = ["depth", "z", "zlev", "lev", "level", "height", "altitude"];
+
+function inferDepthDimensionName(
+  dimensionNames: string[],
+  latName: string,
+  lonName: string,
+  timeDimName: string | null,
+) {
+  // A depth axis is any non-horizontal, non-time dimension. Prefer well-known
+  // names, then fall back to the first leftover dimension.
+  const candidates = dimensionNames.filter(
+    (dim) => dim !== latName && dim !== lonName && dim !== timeDimName,
+  );
+  const named = candidates.find((dim) => DEPTH_DIMENSION_NAMES.includes(normalizeText(dim)));
+  return named ?? candidates[0] ?? null;
 }
 function clampLatitudeToMercator(latitude: number) {
   return Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, latitude));
@@ -364,6 +390,7 @@ export class ZarrOverlay {
   private prefetchedPromise: Promise<{ result: any; dirResult: any | null }> | null = null;
   private cachedStats: { min: number; max: number; units: string } | null = null;
   private timeIndex = 0;
+  private depthIndex = 0;
   private playInterval: ReturnType<typeof setInterval> | null = null;
   private mounted = true;
 
@@ -409,6 +436,9 @@ export class ZarrOverlay {
   public onStatsChange?: (min: number, max: number, units: string) => void;
   public onLoadingChange?: (loading: boolean) => void;
   public onErrorChange?: (error: string | null) => void;
+  // Fires after the dataset loads with the depth levels (empty when the dataset
+  // has no vertical dimension), so the UI can show/hide a depth slider.
+  public onDepthChange?: (levels: number[], idx: number, units: string) => void;
 
   constructor(map: maplibregl.Map, config: ZarrLayerConfig) {
     this.map = map;
@@ -545,6 +575,8 @@ export class ZarrOverlay {
     if (latAxis < 0 || lonAxis < 0 || spatialDims.length !== 2) throw new Error("Only rectilinear lat/lon rasters supported.");
     if (this.config.directionVariable && (dirLatAxis < 0 || dirLonAxis < 0 || dirSpatialDims.length !== 2)) throw new Error("Direction variable must be rectilinear lat/lon.");
 
+    const depthDim = inferDepthDimensionName(dimNames, latName, lonName, timeDim);
+
     const group = await openZarrita(store, { kind: "group" });
     const [variable, directionVar, latArr, lonArr] = await Promise.all([
       openZarrita(group.resolve(this.config.heightVariable), { kind: "array" }),
@@ -553,6 +585,22 @@ export class ZarrOverlay {
       openZarrita(group.resolve(lonName), { kind: "array" }),
     ]);
     const [latRaw, lonRaw] = await Promise.all([zarritaGet(latArr), zarritaGet(lonArr)]);
+
+    // Depth axis: read the coordinate values (for slider labels) when present.
+    const depthDimIndex = depthDim ? dimNames.indexOf(depthDim) : -1;
+    const depthCount = depthDimIndex >= 0 ? Number(variable.shape?.[depthDimIndex] ?? 1) : 1;
+    let depthValues: number[] = [];
+    let depthUnits = "";
+    if (depthDim && depthCount > 1) {
+      try {
+        const depthArr = await openZarrita(group.resolve(depthDim), { kind: "array" });
+        const depthRaw = await zarritaGet(depthArr);
+        depthValues = Array.from(depthRaw.data as ArrayLike<number>, Number);
+        depthUnits = normalizeText(inlineMetadata[depthDim]?.attributes?.units);
+      } catch {
+        depthValues = Array.from({ length: depthCount }, (_, i) => i);
+      }
+    }
     const latValues = Array.from(latRaw.data as ArrayLike<number>, Number);
     const lonValues = Array.from(lonRaw.data as ArrayLike<number>, Number);
 
@@ -612,6 +660,11 @@ export class ZarrOverlay {
       directionDimensionNames: dirDimNames,
       timeDimensionName: timeDim,
       directionTimeDimensionName: dirTimeDim,
+      depthDimensionName: depthDim,
+      depthCount,
+      depthValues,
+      depthUnits,
+      hasDepth: Boolean(depthDim && depthCount > 1),
       timeCount,
       hasTime: Boolean(timeDim && timeCount > 1),
       timeStart: timeStart && !isNaN(timeStart.getTime()) ? timeStart : null,
@@ -651,6 +704,12 @@ export class ZarrOverlay {
       0,
       this.dataset.timeCount - 1
     );
+    if (this.dataset.hasDepth) {
+      this.depthIndex = Math.min(this.depthIndex, this.dataset.depthCount - 1);
+      this.onDepthChange?.(this.dataset.depthValues, this.depthIndex, this.dataset.depthUnits);
+    } else {
+      this.onDepthChange?.([], 0, "");
+    }
     return this.dataset;
   }
 
@@ -678,8 +737,9 @@ export class ZarrOverlay {
     try {
       const dataset = await this.ensureDatasetLoaded();
       const activeTime = dataset.hasTime ? Math.min(this.timeIndex, dataset.timeCount - 1) : 0;
-      const selection = buildSliceSelection(dataset.dimensionNames, dataset.latName, dataset.lonName, dataset.timeDimensionName, activeTime);
-      const dirSelection = dataset.directionVariable ? buildSliceSelection(dataset.directionDimensionNames, dataset.latName, dataset.lonName, dataset.directionTimeDimensionName, activeTime) : null;
+      const activeDepth = dataset.hasDepth ? Math.min(this.depthIndex, dataset.depthCount - 1) : 0;
+      const selection = buildSliceSelection(dataset.dimensionNames, dataset.latName, dataset.lonName, dataset.timeDimensionName, activeTime, dataset.depthDimensionName, activeDepth);
+      const dirSelection = dataset.directionVariable ? buildSliceSelection(dataset.directionDimensionNames, dataset.latName, dataset.lonName, dataset.directionTimeDimensionName, activeTime, dataset.depthDimensionName, activeDepth) : null;
 
       let result: any;
       let dirResult: any | null;
@@ -703,6 +763,8 @@ export class ZarrOverlay {
             dataset.lonName,
             dataset.timeDimensionName,
             nextTime,
+            dataset.depthDimensionName,
+            activeDepth,
           );
           const nextDirSelection = dataset.directionVariable
             ? buildSliceSelection(
@@ -711,6 +773,8 @@ export class ZarrOverlay {
                 dataset.lonName,
                 dataset.directionTimeDimensionName,
                 nextTime,
+                dataset.depthDimensionName,
+                activeDepth,
               )
             : null;
 
@@ -1047,6 +1111,18 @@ export class ZarrOverlay {
 
   public getTimeCount() {
     return this.dataset?.timeCount ?? 1;
+  }
+
+  public setDepthIndex(index: number) {
+    const maxDepth = (this.dataset?.depthCount ?? 1) - 1;
+    const next = Math.max(0, Math.min(index, maxDepth < 0 ? 0 : maxDepth));
+    if (next === this.depthIndex) return;
+    this.depthIndex = next;
+    // Invalidate any prefetched slice (it was fetched at the old depth).
+    this.prefetchedTimeIndex = null;
+    this.prefetchedPromise = null;
+    this.cachedStats = null;
+    this.requestRender();
   }
 
   public startPlayback(intervalMs = 700) {

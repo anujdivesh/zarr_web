@@ -191,6 +191,7 @@ export interface UgridLayerConfig {
   arrowStride?: number;
   arrowSize?: number;
   directionAngleOffset?: number;
+  windAnimation?: import("./WindAnimationOverlay").WindConfig;
 }
 
 export class UgridOverlay {

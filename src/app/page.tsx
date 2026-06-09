@@ -11,12 +11,14 @@ import "maplibre-gl/dist/maplibre-gl.css";
 type OverlayController = {
   destroy: () => void;
   setTimeIndex: (value: number) => void;
+  setDepthIndex?: (value: number) => void;
   startPlayback: (intervalMs?: number) => void;
   stopPlayback: () => void;
   onLoadingChange?: (loading: boolean) => void;
   onErrorChange?: (error: string | null) => void;
   onTimeChange?: (label: string, idx: number, max: number) => void;
   onStatsChange?: (min: number, max: number, units: string) => void;
+  onDepthChange?: (levels: number[], idx: number, units: string) => void;
 };
 
 export default function Home() {
@@ -25,7 +27,9 @@ export default function Home() {
   const overlayRef = useRef<OverlayController | null>(null);
   const windRef = useRef<WindAnimationOverlay | null>(null);
   const [selectedLayerId, setSelectedLayerId] = useState(layersConfig[0].id);
-  const [showWind, setShowWind] = useState(false);
+  const [showWind, setShowWind] = useState(true);
+  const [depth, setDepth] = useState({ levels: [] as number[], index: 0, units: "" });
+  const depthIndexRef = useRef(0);
   const [layerUi, setLayerUi] = useState({
     loading: false,
     error: null as string | null,
@@ -85,6 +89,8 @@ export default function Home() {
       stats: null,
       units: "",
     });
+    depthIndexRef.current = 0;
+    setDepth({ levels: [], index: 0, units: "" });
 
     const overlay: OverlayController = currentLayer.type === "ugrid"
       ? new UgridOverlay(mapRef.current, currentLayer)
@@ -94,6 +100,7 @@ export default function Home() {
     overlay.onErrorChange = (error) => setLayerUi(prev => ({ ...prev, error }));
     overlay.onTimeChange = (label, idx, max) => setLayerUi(prev => ({ ...prev, timeLabel: label, timeIndex: idx, timeMax: max }));
     overlay.onStatsChange = (min, max, units) => setLayerUi(prev => ({ ...prev, stats: { min, max }, units }));
+    overlay.onDepthChange = (levels, idx, units) => setDepth({ levels, index: idx, units });
 
     overlayRef.current = overlay;
 
@@ -108,12 +115,13 @@ export default function Home() {
       windRef.current = null;
     }
 
-    if (currentLayer.type !== "zarr" || !currentLayer.windAnimation || !showWind) {
+    if (!currentLayer.windAnimation || !showWind) {
       return;
     }
 
     const wind = new WindAnimationOverlay(mapRef.current, currentLayer.windAnimation);
     wind.setTimeIndex(layerUi.timeIndex);
+    if (depthIndexRef.current > 0) wind.setDepthIndex(depthIndexRef.current);
     windRef.current = wind;
 
     return () => {
@@ -135,6 +143,19 @@ export default function Home() {
     if (overlayRef.current) overlayRef.current.setTimeIndex(val);
   };
 
+  const handleDepthSlider = (val: number) => {
+    depthIndexRef.current = val;
+    setDepth(prev => ({ ...prev, index: val }));
+    overlayRef.current?.setDepthIndex?.(val);
+    windRef.current?.setDepthIndex(val);
+  };
+
+  const formatDepth = (value: number) => {
+    // Depth is stored negative-down (e.g. -5 = 5 m below surface).
+    const magnitude = Math.abs(value);
+    return `${magnitude % 1 === 0 ? magnitude : magnitude.toFixed(1)} m`;
+  };
+
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative" }}>
       <div ref={mapContainer} style={{ position: "absolute", inset: 0 }} />
@@ -142,7 +163,7 @@ export default function Home() {
         <select value={selectedLayerId} onChange={e => setSelectedLayerId(e.target.value)}>
           {layersConfig.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
         </select>
-        {currentLayer.type === "zarr" && currentLayer.windAnimation && (
+        {currentLayer.windAnimation && (
           <label style={{ display: "block", marginTop: 8, fontSize: 13 }}>
             <input
               type="checkbox"
@@ -154,6 +175,22 @@ export default function Home() {
           </label>
         )}
       </div>
+      {depth.levels.length > 1 && (
+        <div style={{ position: "absolute", left: 16, top: "50%", transform: "translateY(-50%)", zIndex: 10, padding: "12px 10px", borderRadius: 12, background: "rgba(15,23,42,0.9)", color: "#f8fafc", display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+          <div style={{ fontSize: 12, fontWeight: "bold" }}>Depth</div>
+          <div style={{ fontSize: 12, minWidth: 48, textAlign: "center" }}>{formatDepth(depth.levels[depth.index])}</div>
+          <input
+            type="range"
+            min={0}
+            max={depth.levels.length - 1}
+            step={1}
+            value={depth.index}
+            onChange={e => handleDepthSlider(Number(e.target.value))}
+            style={{ writingMode: "vertical-lr", direction: "rtl", height: 200 }}
+          />
+          <div style={{ fontSize: 10, opacity: 0.7, textAlign: "center", lineHeight: 1.3 }}>surface<br />↑ ↓<br />deep</div>
+        </div>
+      )}
       <div style={{ position: "absolute", bottom: 16, right: 16, zIndex: 10, width: 320, padding: 16, borderRadius: 12, background: "rgba(15,23,42,0.9)", color: "#f8fafc" }}>
         <div style={{ fontWeight: "bold" }}>{currentLayer.name}</div>
         <div style={{ fontSize: 13 }}>{layerUi.loading ? "Loading..." : layerUi.timeLabel}</div>
