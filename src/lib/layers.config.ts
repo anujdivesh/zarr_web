@@ -92,7 +92,7 @@ export const layersConfig: LayerConfig[] = [
     zarrBaseUrl: "https://s3.ap-southeast-2.wasabisys.com/spc-zarr-file/",    // or wherever your API routes serve the Zarr
     heightVariable: "h",
     // Remove colorRange and colormap temporarily
-    colorRange: { min: 0, max: 4 },
+    colorRange: { min: 0, max: 2 },
     colormap: "jet",
     showRaster: true,
     showArrows: false,
